@@ -1,11 +1,12 @@
-from django.http import HttpResponseNotAllowed
-from django.shortcuts import get_object_or_404, redirect, render
 
-from .models import Choice, Course, Question, Submission, SubmissionAnswer
+from django.shortcuts import get_object_or_404, redirect, render
+from django.http import HttpResponseNotAllowed
+from django.contrib.auth.decorators import login_required
+
+from .models import Course, Lesson, Question, Choice, Enrollment, Submission
 
 
 def course_details(request, course_id):
-    """Display a course and its related lessons."""
     course = get_object_or_404(
         Course.objects.prefetch_related("lessons"),
         pk=course_id,
@@ -17,109 +18,152 @@ def course_details(request, course_id):
     )
 
 
+def check_if_enrolled(user, course):
+    if not user.is_authenticated:
+        return False
+
+    return Enrollment.objects.filter(
+        user=user,
+        course=course,
+    ).exists()
+
+
+def extract_answers(request):
+    """Collect selected choice IDs from the submitted exam form."""
+    submitted_answers = []
+
+    for key in request.POST:
+        if key.startswith("choice"):
+            submitted_answers.extend(
+                int(value)
+                for value in request.POST.getlist(key)
+                if value.isdigit()
+            )
+
+    return submitted_answers
+
+
+@login_required
 def submit(request, course_id):
-    """Grade a submitted mock exam and save its answers."""
+    """Create a submission for the logged-in learner's enrollment."""
     if request.method != "POST":
         return HttpResponseNotAllowed(["POST"])
 
     course = get_object_or_404(Course, pk=course_id)
-    questions = list(
-        Question.objects.filter(lesson__course=course)
-        .select_related("lesson")
-        .prefetch_related("choices")
-        .order_by("lesson__order", "id")
+
+    enrollment = get_object_or_404(
+        Enrollment,
+        user=request.user,
+        course=course,
     )
 
-    student_name = request.POST.get("student_name", "Student").strip() or "Student"
     submission = Submission.objects.create(
-        course=course,
-        student_name=student_name,
-        score=0,
+        enrollment=enrollment
     )
+
+    selected_ids = extract_answers(request)
+
+    # Only save choices belonging to questions in this course.
+    choices = Choice.objects.filter(
+        id__in=selected_ids,
+        question__course=course,
+    )
+
+    submission.choices.set(choices)
 
     score = 0
-    for question in questions:
-        selected_id = request.POST.get(f"question_{question.id}")
-        selected_choice = None
 
-        if selected_id:
-            # Only accept a choice that belongs to the current question.
-            selected_choice = next(
-                (choice for choice in question.choices.all()
-                 if str(choice.pk) == str(selected_id)),
-                None,
-            )
+    for question in Question.objects.filter(course=course):
+        selected_for_question = choices.filter(
+            question=question
+        ).values_list("id", flat=True)
 
-        is_correct = bool(selected_choice and selected_choice.is_correct)
-        if is_correct:
-            score += 1
-
-        SubmissionAnswer.objects.create(
-            submission=submission,
-            question=question,
-            selected_choice=selected_choice,
-            is_correct=is_correct,
-        )
+        score += question.is_get_score(selected_for_question)
 
     submission.score = score
-    submission.save(update_fields=["score"])
+    submission.completed = True
+    submission.save()
 
     return redirect(
-        "show_exam_result",
-        course_id=course.pk,
-        submission_id=submission.pk,
+        "onlinecourse:show_exam_result",
+        course_id=course.id,
+        submission_id=submission.id,
     )
 
 
+@login_required
 def show_exam_result(request, course_id, submission_id):
-    """Display the saved score and answer-by-answer exam results."""
+    """Calculate and display the learner's exam result."""
     course = get_object_or_404(Course, pk=course_id)
+
     submission = get_object_or_404(
-        Submission.objects.prefetch_related(
-            "answers__question",
-            "answers__selected_choice",
-        ),
+        Submission,
         pk=submission_id,
-        course=course,
+        enrollment__user=request.user,
+        enrollment__course=course,
     )
 
-    answers = submission.answers.all().order_by(
-        "question__lesson__order",
-        "question_id",
+    selected_ids = set(
+        submission.choices.values_list("id", flat=True)
     )
-    total_questions = Question.objects.filter(lesson__course=course).count()
+
+    results = []
+    total_score = 0
+
+    questions = Question.objects.filter(
+        course=course
+    ).prefetch_related("choices")
+
+    for question in questions:
+        possible_choices = question.choices.all()
+
+        question_choice_ids = set(
+            possible_choices.values_list("id", flat=True)
+        )
+
+        selected_for_question = selected_ids.intersection(
+            question_choice_ids
+        )
+
+        correct_ids = set(
+            possible_choices.filter(
+                is_correct=True
+            ).values_list("id", flat=True)
+        )
+
+        question_score = question.is_get_score(
+            selected_for_question
+        )
+
+        total_score += question.grade
+
+        results.append({
+            "question": question,
+            "choices": possible_choices,
+            "possible": possible_choices,
+            "selected_ids": selected_for_question,
+            "correct_ids": correct_ids,
+            "is_correct": question_score > 0,
+            "grade": question.grade,
+            "score": question_score,
+        })
+
     percentage = (
-        round((submission.score / total_questions) * 100)
-        if total_questions
+        round((submission.score / total_score) * 100, 2)
+        if total_score
         else 0
     )
 
-    results = [
-        {
-            "question_text": answer.question.question_text,
-            "selected_choice": (
-                answer.selected_choice.choice_text
-                if answer.selected_choice
-                else "No answer selected"
-            ),
-            "is_correct": answer.is_correct,
-            "correct_choices": list(
-                answer.question.choices.filter(is_correct=True)
-                .values_list("choice_text", flat=True)
-            ),
-        }
-        for answer in answers
-    ]
-
     return render(
         request,
-        "onlinecourse/exam_result.html",
+        "onlinecourse/exam_result_bootstrap.html",
         {
             "course": course,
             "submission": submission,
             "results": results,
-            "total_questions": total_questions,
+            "selected_ids": selected_ids,
             "score": submission.score,
-            "percentage": percentage,
+            "total_score": total_score,
+            "grade": percentage,
         },
     )
